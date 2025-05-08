@@ -6,12 +6,11 @@ from flask import Flask, request, jsonify
 from etl import etl_ghg, etl_covid
 
 DB_PATH   = 'data.db'
-CLEAN_CSV = 'gas_emissions_canada.csv'  # raw CSV used by ETL; data lives in SQLite 'ghg'
+CLEAN_CSV = 'gas_emissions_canada.csv'
 
 app = Flask(__name__)
 
 def get_covid_report_for_province(province_code):
-    """Gets the latest COVID report for a province via live API."""
     url = f"https://api.covid19tracker.ca/reports/province/{province_code.lower()}"
     try:
         resp = requests.get(url, timeout=10)
@@ -31,23 +30,21 @@ def get_covid_report_for_province(province_code):
         return {"error": str(e)}
 
 def load_cleaned_ghg():
-    """Read the GHG table from SQLite (populated by etl_ghg)."""
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("SELECT * FROM ghg", conn)
     conn.close()
     return df
 
+# run ETL to ensure tables exist and are fresh
 def initialize():
-    """Run ETL pipelines once, creating data.db if it doesn't exist."""
-    if not os.path.exists(DB_PATH):
-        try:
-            etl_ghg()
-        except Exception as e:
-            app.logger.error(f"GHG ETL failed: {e}")
-        try:
-            etl_covid()
-        except Exception as e:
-            app.logger.error(f"COVID ETL failed: {e}")
+    try:
+        etl_ghg()
+    except Exception as e:
+        app.logger.error(f"GHG ETL failed: {e}")
+    try:
+        etl_covid()
+    except Exception as e:
+        app.logger.error(f"COVID ETL failed: {e}")
 
 @app.route('/', methods=['GET'])
 def home():
@@ -63,7 +60,6 @@ def chat():
     if not msg:
         return jsonify(error="Please include 'question' or 'message'"), 400
 
-    # COVID logic: live API per-province, or national via SQLite
     if any(k in msg for k in ('covid','case','death')):
         for prov in ["on","qc","bc","ab","mb","sk","ns","nb","nl","pe","nt","yt","nu"]:
             if prov in msg:
@@ -75,7 +71,6 @@ def chat():
                     f"{res['total_cases']} cases, {res['active_cases']} active, "
                     f"{res['deaths']} deaths."
                 ))
-        # fallback: national summary
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
             "SELECT date, total_cases, total_fatalities "
@@ -87,7 +82,6 @@ def chat():
             return jsonify(answer=f"As of {d[:10]}: {c} cases, {f} fatalities.")
         return jsonify(answer="No COVID data available.")
 
-    # GHG logic: per-province via SQLite, or aggregate by year
     if 'emission' in msg or 'ghg' in msg:
         df = load_cleaned_ghg()
         for prov in df['province'].str.lower().unique():
@@ -98,7 +92,6 @@ def chat():
                     'emissions'
                 ].iloc[0]
                 return jsonify(answer=f"In {latest}, {prov.upper()} emitted {val} Mt CO₂e.")
-        # fallback: aggregate across provinces
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute(
             "SELECT year, SUM(emissions) as total FROM ghg GROUP BY year ORDER BY year"
