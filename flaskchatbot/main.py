@@ -1,100 +1,128 @@
-import os
-import sqlite3
+import os, re, sqlite3
 import pandas as pd
 import requests
 from flask import Flask, request, jsonify
-from etl import etl_ghg, etl_covid
+from etl import etl_ghg
 
-# Work from this file’s directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
-
-# Database and CSV file paths
-DB_PATH  = os.path.join(BASE_DIR, 'data.db')
-CSV_PATH = os.path.join(BASE_DIR, 'gas_emissions_canada.csv')
+DB_PATH = os.path.join(BASE_DIR, 'data.db')
 
 app = Flask(__name__)
 
-def get_covid_report_for_province(province_code):
-    """Fetch the latest COVID report via live API for a given province code."""
-    url = f"https://api.covid19tracker.ca/reports/province/{province_code.lower()}"
+# Map province codes to full names
+PROVINCES = {
+    'ab': 'Alberta',         'bc': 'British Columbia',
+    'mb': 'Manitoba',        'nb': 'New Brunswick',
+    'nl': 'Newfoundland & Labrador',
+    'ns': 'Nova Scotia',     'nt': 'Northwest Territories',
+    'nu': 'Nunavut',         'on': 'Ontario',
+    'pe': 'Prince Edward Island',
+    'qc': 'Quebec',          'sk': 'Saskatchewan',
+    'yt': 'Yukon'
+}
+
+def get_covid_report_for_province(code):
+    url = f"https://api.covid19tracker.ca/reports/province/{code}"
     resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        return {"error": f"API error: {resp.status_code}"}
     data = resp.json().get("data", [])
     if not data:
-        return {"error": "No data returned for that province."}
+        return {"error": "No data for that province."}
     latest = data[-1]
+    tc = latest.get("total_cases", 0)
+    tf = latest.get("total_fatalities", 0)
+    tr = latest.get("total_recoveries", 0)
+    active = tc - tf - tr
     return {
-        "date":             latest.get("date","N/A"),
-        "total_cases":      latest.get("total_cases",0),
-        "active_cases":     latest.get("total_hospitalizations",0),
-        "total_fatalities": latest.get("total_fatalities",0),
-        "deaths":           latest.get("total_fatalities",0)
+        "date": latest.get("date", "N/A"),
+        "total_cases": tc,
+        "active_cases": active,
+        "total_recoveries": tr,
+        "total_fatalities": tf
     }
 
 def load_cleaned_ghg():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql("SELECT * FROM ghg", conn)
-    conn.close()
-    return df
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql("SELECT * FROM ghg", conn)
+        conn.close()
+        return df
+    except Exception as e:
+        app.logger.error(f"GHG load error: {e}")
+        return None
 
+@app.before_first_request
 def initialize():
-    # Always rebuild the GHG table locally
-    print("🔄 Running GHG ETL…")
-    etl_ghg()
-    print("✔️ GHG ETL complete.")
+    app.logger.info("🔄 Running GHG ETL…")
+    try:
+        etl_ghg()
+        app.logger.info("✔️ GHG ETL complete.")
+    except Exception as e:
+        app.logger.error(f"ETL failed: {e}")
 
 @app.route('/', methods=['GET'])
 def home():
     return (
-        "🌍 Welcome to the DS2002 Environmental Chatbot!  "
-        "POST JSON {'question':…} or {'message':…} to /chat"
+        "🌍 DS2002 Environmental Chatbot<br>"
+        "POST JSON {'question':…} to /chat"
     )
 
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.get_json(silent=True) or {}
-    msg = (data.get('question') or data.get('message') or '').strip().lower()
+    msg = (data.get('question') or data.get('message') or "").lower()
     if not msg:
-        return jsonify(error="Please include 'question' or 'message'"), 400
+        return jsonify(error="Include 'question' or 'message'"), 400
 
-    # ——— COVID logic: always use live API
+    # COVID logic
     if any(k in msg for k in ('covid','case','death')):
-        for prov in ["on","qc","bc","ab","mb","sk","ns","nb","nl","pe","nt","yt","nu"]:
-            if prov in msg:
-                res = get_covid_report_for_province(prov)
+        for code, name in PROVINCES.items():
+            if re.search(rf"\b{code}\b", msg) or name.lower() in msg:
+                res = get_covid_report_for_province(code)
                 if 'error' in res:
                     return jsonify(error=res['error']), 500
                 return jsonify(answer=(
-                    f"As of {res['date']}, {prov.upper()} has "
-                    f"{res['total_cases']} total cases, {res['active_cases']} active, "
-                    f"{res['deaths']} deaths."
+                    f"As of {res['date']}, {name} has "
+                    f"{res['total_cases']} total cases, "
+                    f"{res['active_cases']} active cases, "
+                    f"{res['total_recoveries']} recoveries, and "
+                    f"{res['total_fatalities']} deaths."
                 ))
-        return jsonify(error="Please specify a province code (e.g., ON, QC, BC)."), 400
+        return jsonify(error="Specify a valid province code/name (e.g. ON, Ontario)."), 400
 
-    # ——— GHG logic: local ETL’d CSV → SQLite
+    # GHG logic
     if 'emission' in msg or 'ghg' in msg:
         df = load_cleaned_ghg()
-        for prov in df['province'].str.lower().unique():
-            if prov in msg:
-                latest = df['year'].max()
-                val = df.loc[
-                    (df['province'].str.lower()==prov)&(df['year']==latest),
+        if df is None or df.empty:
+            return jsonify(error="GHG data unavailable."), 500
+        for code, name in PROVINCES.items():
+            if re.search(rf"\b{code}\b", msg) or name.lower() in msg:
+                year = df['year'].max()
+                val  = df.loc[
+                    (df['province'].str.upper()==code.upper()) &
+                    (df['year']==year),
                     'emissions'
                 ].iloc[0]
-                return jsonify(answer=f"In {latest}, {prov.upper()} emitted {val} Mt CO₂e.")
+                return jsonify(answer=f"In {year}, {name} emitted {val:.1f} Mt CO₂e.")
         # aggregate fallback
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute(
-            "SELECT year, SUM(emissions) AS total FROM ghg GROUP BY year ORDER BY year"
-        ).fetchall()
-        conn.close()
-        lines = [f"{yr}: {tot:.1f} Mt" for yr,tot in rows]
-        return jsonify(answer="GHG by year:\n" + "\n".join(lines))
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT year, SUM(emissions) total FROM ghg GROUP BY year ORDER BY year"
+            ).fetchall()
+            conn.close()
+            lines = [f"{yr}: {tot:.1f} Mt" for yr, tot in rows]
+            return jsonify(answer="GHG by year:\n" + "\n".join(lines))
+        except Exception as e:
+            app.logger.error(f"Aggregate GHG error: {e}")
+            return jsonify(error="Error retrieving GHG aggregates."), 500
 
-    return jsonify(answer="Try asking about COVID or GHG emissions in a Canadian province.")
+    return jsonify(answer="Ask me about COVID or GHG emissions in Canada."), 200
 
 if __name__ == '__main__':
     initialize()
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
