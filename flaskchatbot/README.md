@@ -1,4 +1,6 @@
 # DS2002 Environmental Chatbot
+Group Name: import numpy
+Group Members: Natalie Siewick, Haley Mitchell, Srujana Yalamanchili, Vivian Jiang, and Alexa Lathom
 
 A Flask chatbot that answers:
 
